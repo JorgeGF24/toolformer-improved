@@ -1,0 +1,8 @@
+Average of list
+0.32798389102285
+Standard deviation of list
+0.19326237047053332
+Max of list
+0.9916599988937378
+Min of list
+0.0

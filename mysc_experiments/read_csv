@@ -1,0 +1,44 @@
+import os
+from csv import DictWriter
+from torch.utils.data import DataLoader
+from datasets import load_dataset
+
+
+cache_dir = "/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/toolformer/cache"
+files = [f'good_data/calendar_short/{i}.csv' for i in range(9)]
+dataset = load_dataset("good_data/calendar_short/", cache_dir=cache_dir, split="train")
+dataset.set_format("torch")
+dataloader = DataLoader(dataset, batch_size=500)
+
+# invoking this will
+# (1) prompt the model with your inputs (data), inserted into [PAD] tag
+# (2) with the sampled outputs, filter out the ones that made proper API calls
+# (3) execute the API calls with the `tool` given
+# (4) filter with the specialized filter function (which can be used independently as shown in the next section)
+# (5) fine-tune on the filtered results
+
+file_counter = 0
+
+def file_name(tool, id):
+    return f"augmented/{tool}/{id}.csv"
+
+def data_row(processed_data, raw_data):
+    raw_data['API_calls_text'] = processed_data[1]
+    raw_data['API_call_response_text'] = processed_data[2]
+    return raw_data
+
+calc_field_names = ['url', 'text', 'API_calls_text', 'API_call_response_text', 'title', 'date_download', 'digest', 'length', 'nlines', 'source_domain', 'cc_segment', 'original_nlines', 'original_length', 'language', 'language_score', 'perplexity', 'bucket']
+calend_field_names = ['url', 'text', 'API_calls_text', 'API_call_response_text', 'date', 'title', 'date_download', 'digest', 'length', 'nlines', 'source_domain', 'cc_segment', 'original_nlines', 'original_length', 'language', 'language_score', 'perplexity', 'bucket']
+max_file_size = 5000000
+
+# check if the file calculator_0.csv exists and create them if not with field_names as the header
+if not os.path.exists(file_name("calendar", file_counter)):
+    with open(file_name("calendar", file_counter) , 'w') as f:
+        writer = DictWriter(f, fieldnames=calend_field_names)
+        writer.writeheader()
+
+generated_samples = 0
+
+for data in dataloader:
+    print("DATA")
+    print(data['text'][0])
