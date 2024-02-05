@@ -28,7 +28,6 @@ from beartype.typing import List
 class TimeoutError(Exception):
     pass
 
-MAX_SENTENCES_PER_TEXT = 50
 
 def timeout(seconds=10, error_message=os.strerror(errno.ETIME)):
     def decorator(func):
@@ -175,10 +174,10 @@ def calc_available(
 
 sentence_split = nltk.data.load('tokenizers/punkt/english.pickle', cache=False)
 
-cache_dir = "/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/toolformer/cache"
+cache_dir = None
 cache_option = {"cache_dir": cache_dir} if cache_dir else {} 
 
-tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-j-6B", max_length=270, **cache_option)
+tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", **cache_option)
 
 space = tokenizer.encode(" ")
 
@@ -202,7 +201,7 @@ def task(data, check_calc= True, check_calend= True, check_wiki= True):
     text = sentence_split.tokenize(text)
     # make every sentence end with a period
     tokenized_sentences = []
-    for sentence in text[:MAX_SENTENCES_PER_TEXT]:
+    for sentence in text:
         tokenized_sentences += break_sentence(sentence)
 
     sentences = []
@@ -212,7 +211,7 @@ def task(data, check_calc= True, check_calend= True, check_wiki= True):
             current_sentence += sentence
         elif len(current_sentence) > 0:
             current_sentence += sentence
-            if len(current_sentence) > 80:
+            if len(current_sentence) > 100:
                 sentences.append(tokenizer.decode(current_sentence))
                 current_sentence = []
         else:
@@ -243,6 +242,7 @@ def task(data, check_calc= True, check_calend= True, check_wiki= True):
             'language_score': data['language_score'],
             'perplexity': data['perplexity'],
             'bucket': data['bucket'],
+            'source_file': data['source_file']
         }
         if date:
             row['date'] = date
@@ -274,9 +274,9 @@ erase = True
 if __name__ == "__main__":
     print("HELLO")
 
-    cache_dir = "/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/toolformer/cache"
-    dataset_dir = "/vol/bitbucket/jg2619/augmenting_llms/dependencies/cc_net/data2/mined/2019-09_copy/"
-    processed_dir = "/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/data/preprocessed/longer_sentences_load/"  # "/vol/bitbucket/jg2619/data/preprocessed/big_load/"
+    cache_dir = None
+    dataset_dir = "/home/tromero_client/ccnet_filenames"
+    processed_dir = "/home/tromero_client/ccnet_filenames/processed"  # "/vol/bitbucket/jg2619/data/preprocessed/big_load/"
 
     def file_name(tool, id):
         return f"{processed_dir}{tool}/{id}.csv"
@@ -299,12 +299,12 @@ if __name__ == "__main__":
 
     max_perplexity = 1000
 
-    sample_size = 20000
+    sample_size = 150000
     max_file_lines = 50000
 
     # Ouput file will have columns;
     # url, text, title, date_download, digest, length, nlines, source_domain, cc_segment, original_nlines, original_length, language, language_score, perplexity, bucket
-    field_names = {"calculator":['url', 'text', 'title', 'date_download', 'digest', 'length', 'nlines', 'source_domain', 'cc_segment', 'original_nlines', 'original_length', 'language', 'language_score', 'perplexity', 'bucket']}
+    field_names = {"calculator":['url', 'text', 'title', 'date_download', 'digest', 'length', 'nlines', 'source_domain', 'cc_segment', 'original_nlines', 'original_length', 'language', 'language_score', 'perplexity', 'bucket', 'source_file']}
     field_names["calendar"] = field_names["calculator"][:2] + ['date'] + field_names["calculator"][2:]
     field_names["wikiSearch"] = field_names["calculator"]
     # And a shorter file with:
@@ -446,3 +446,19 @@ if __name__ == "__main__":
     print(f"Chose {calc_data_outcome['keywords']} calculator examples that had keywords")
     print(f"Chose {calc_data_outcome['operator_and_keywords']} calculator examples that had both operators and keywords")
     print(f"Chose {calc_data_outcome['operation_combination']} calculator examples that had three numbers that could be operated into each other")
+    
+    
+    # Save stats to a stats file
+    with open("stats.txt", "w") as f:
+        f.write(f"Processed {processed_rows} rows in {time.process_time() - start_time} seconds\n")
+        for tool in tools:
+            f.write(f"Found {written_examples[tool]} {tool} examples\n")
+        f.write(f"Skipped {calend_data_outcome['skipped']} calendar examples\n")
+        f.write(f"Chose {calend_data_outcome['date_present']} calendar examples\n")
+        f.write(f"Skipped {calc_data_outcome['skipped']} calculator examples as they failed to meet the criteria\n")
+        f.write(f"Skipped {calc_data_outcome['skipped_random']} calculator examples that had numbers\n")
+        f.write(f"Chose {calc_data_outcome['choose_random']} random calculator examples that had numbers\n")
+        f.write(f"Chose {calc_data_outcome['operator_present']} calculator examples that had operators\n")
+        f.write(f"Chose {calc_data_outcome['keywords']} calculator examples that had keywords\n")
+        f.write(f"Chose {calc_data_outcome['operator_and_keywords']} calculator examples that had both operators and keywords\n")
+        f.write(f"Chose {calc_data_outcome['operation_combination']} calculator examples that had three numbers that could be operated into each other\n")

@@ -41,7 +41,7 @@ def augment_database(
 
     print(f"ERASE IS SET TO {erase}")
 
-    cache_dir = "/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/toolformer/cache"
+    cache_dir = None
     cache_option = {"cache_dir": cache_dir} if cache_dir else {} 
 
     if model_name == "GPTJ":
@@ -110,7 +110,7 @@ def augment_database(
     # toolformer
     toolformer = Toolformer(
         model=model,
-        pad_token = tokenizer.pad_token, 
+        pad_token = tokenizer.pad_token,
         max_arg_length=max_args_length,
         max_data_length=max_data_length,
         max_response_length=response_length,
@@ -335,4 +335,3 @@ def prepare_new_file(file_name:str, header:list, erase:bool):
         with open(file_name, 'w') as f:
             writer = DictWriter(f, fieldnames=header)
             writer.writeheader()
-    
