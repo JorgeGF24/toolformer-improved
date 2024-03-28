@@ -149,13 +149,6 @@ def augment_database(
         dataloader = DataLoader(dataset, batch_size=data_batch_size)
         data_iter = iter(dataloader)
 
-    # invoking this will
-    # (1) prompt the model with your inputs (data), inserted into [PAD] tag
-    # (2) with the sampled outputs, filter out the ones that made proper API calls
-    # (3) execute the API calls with the `tool` given
-    # (4) filter with the specialized filter function (which can be used independently as shown in the next section)
-    # (5) fine-tune on the filtered results
-
     print("Loaded dataset", flush=True)
     file_counter = len([file for file in os.listdir(augment_dir) if file.endswith('.csv') and not file.endswith("stats.csv")]) - 1
     
@@ -194,7 +187,6 @@ def augment_database(
         return new_row
 
     # Check if the augment_dir exists and create it recursively if not
-    print(not os.path.exists(augment_dir))
     if not os.path.exists(augment_dir):
         os.makedirs(augment_dir)
     os.makedirs(augment_dir + "/stats", exist_ok=True)
