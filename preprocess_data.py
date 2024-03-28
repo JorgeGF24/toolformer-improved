@@ -5,16 +5,11 @@ import re
 
 from datasets import load_dataset
 import dateutil.parser as dparser
-from dateutil.parser import ParserError
 import time
-import argparse
 import nltk.data
-import multiprocessing
 from datetime import datetime
 from transformers import AutoTokenizer
 import traceback
-
-import torch
 
 from csv import DictWriter
 
@@ -22,7 +17,6 @@ from functools import wraps
 import errno
 import signal
 
-import beartype
 from beartype.typing import List
 
 class TimeoutError(Exception):
@@ -178,14 +172,11 @@ cache_dir = None
 cache_option = {"cache_dir": cache_dir} if cache_dir else {} 
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", **cache_option)
-
-space = tokenizer.encode(" ")
+tokenizer.add_bos_token = False
 
 def break_sentence(sentence):
     # Tokenize sentence and break into chunks of 64 tokens
     tokens = tokenizer.encode(sentence, truncation=True, max_length=512, return_overflowing_tokens=True)
-
-    tokens[-1] = tokens[-1] + space
 
     return tokens
 
@@ -207,12 +198,12 @@ def task(data, check_calc= True, check_calend= True, check_wiki= True):
     sentences = []
     current_sentence = []
     for sentence in tokenized_sentences:
-        if len(current_sentence) == 0 and len(sentence) < 30:
+        if len(current_sentence) == 0 and len(sentence) < 50:
             current_sentence += sentence
         elif len(current_sentence) > 0:
             current_sentence += sentence
-            if len(current_sentence) > 100:
-                sentences.append(tokenizer.decode(current_sentence))
+            if len(current_sentence) > 150:
+                sentences.append(tokenizer.decode(current_sentence[:256]))
                 current_sentence = []
         else:
             sentences.append(tokenizer.decode(sentence))
@@ -275,8 +266,8 @@ if __name__ == "__main__":
     print("HELLO")
 
     cache_dir = None
-    dataset_dir = "/home/tromero_client/ccnet_filenames"
-    processed_dir = "/home/tromero_client/ccnet_filenames/processed"  # "/vol/bitbucket/jg2619/data/preprocessed/big_load/"
+    dataset_dir = "/home/jorge/ccnet/merged/source_added"
+    processed_dir = "/home/jorge/ccnet/processed/"  # "/vol/bitbucket/jg2619/data/preprocessed/big_load/"
 
     def file_name(tool, id):
         return f"{processed_dir}{tool}/{id}.csv"
@@ -285,7 +276,7 @@ if __name__ == "__main__":
     file_batch = 0
     file_list = [file for file in os.listdir(dataset_dir) if file.endswith('.json')]
 
-    dataset = load_dataset(dataset_dir, split="train", data_files = file_list[:file_batch_size], cache_dir = cache_dir)
+    dataset = load_dataset(dataset_dir, split="train", data_files = file_list[file_batch * file_batch_size:(file_batch + 1) * file_batch_size], cache_dir = cache_dir)
     iter_data = iter(dataset)
     print("Loaded dataset")
     # Print rfirst row:
@@ -299,7 +290,7 @@ if __name__ == "__main__":
 
     max_perplexity = 1000
 
-    sample_size = 150000
+    sample_size = 500000
     max_file_lines = 50000
 
     # Ouput file will have columns;
@@ -378,8 +369,8 @@ if __name__ == "__main__":
                 print(f"Loading {file_batch}th batch of the dataset")
                 dataset = load_dataset(dataset_dir, cache_dir=cache_dir, data_files = file_list[file_batch * file_batch_size:(file_batch + 1) * file_batch_size], split="train")
                 #dataset.set_format("torch")
-                data_iter = iter(dataset)
-                data = next(data_iter, None)
+                iter_data = iter(dataset)
+                data = next(iter_data, None)
                 continue
             break
         
@@ -430,6 +421,21 @@ if __name__ == "__main__":
                 print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
                 print()
                 print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+
+                # Save stats to a stats file
+        with open("stats.txt", "w") as f:
+            f.write(f"Processed {processed_rows} rows in {time.process_time() - start_time} seconds\n")
+            for tool in tools:
+                f.write(f"Found {written_examples[tool]} {tool} examples\n")
+            f.write(f"Skipped {calend_data_outcome['skipped']} calendar examples\n")
+            f.write(f"Chose {calend_data_outcome['date_present']} calendar examples\n")
+            f.write(f"Skipped {calc_data_outcome['skipped']} calculator examples as they failed to meet the criteria\n")
+            f.write(f"Skipped {calc_data_outcome['skipped_random']} calculator examples that had numbers\n")
+            f.write(f"Chose {calc_data_outcome['choose_random']} random calculator examples that had numbers\n")
+            f.write(f"Chose {calc_data_outcome['operator_present']} calculator examples that had operators\n")
+            f.write(f"Chose {calc_data_outcome['keywords']} calculator examples that had keywords\n")
+            f.write(f"Chose {calc_data_outcome['operator_and_keywords']} calculator examples that had both operators and keywords\n")
+            f.write(f"Chose {calc_data_outcome['operation_combination']} calculator examples that had three numbers that could be operated into each other\n")
 
     print("LLEGAMOS??????")
 
