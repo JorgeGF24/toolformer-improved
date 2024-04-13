@@ -1,14 +1,17 @@
 from csv import QUOTE_ALL, DictWriter, QUOTE_MINIMAL
+import os
 import logging
+
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM, LlamaTokenizer, GPTJConfig, LlamaConfig
-from toolformer import Toolformer
 import torch
 from torch.utils.data import DataLoader, Dataset
-from datasets import load_dataset 
-import os
-
+from torch.nn.parallel import DistributedDataParallel as DDP
+from datasets import load_dataset
 from beartype import beartype
 
+
+
+from toolformer import Toolformer
 
 FILE_BATCH_SIZE = 1   # number of files to load at a time
 GENERATION_TARGET = 50000                                                       
@@ -29,17 +32,19 @@ def augment_db(
     model_name:str="GPTJ",  # "GPTJ" or "LLAMA",
     experiment_config:dict={},
     generated_so_far=0,
+    device="cuda",
+    world_size=1,
     **kwargs,
 ):
     global data_loader, file_batch, stats_num
     previous_model = None
 
     file_batch = 0
-    stats_num = len([file for file in os.listdir(os.path.join(augment_dir,"stats")) if file.startswith("stats")])
     os.makedirs(augment_dir + "/stats", exist_ok=True)
+    stats_num = len([file for file in os.listdir(os.path.join(augment_dir,"stats")) if file.startswith("stats")])
     
     if previous_model != model_name:
-        tokenizer, model = load_model_and_tokenizer(model_name)
+        tokenizer, model = load_model_and_tokenizer(model_name, device=device)
 
         arg_gen_stoppers = []
         for k, v in tokenizer.get_vocab().items():
@@ -61,7 +66,7 @@ def augment_db(
         experiment_config=experiment_config,
         using_llama= model_name == "LLAMA",
         **kwargs
-    ).cuda()
+    )
     
     load_data_kwargs = {
         "dataset_dir": dataset_dir,
@@ -69,13 +74,15 @@ def augment_db(
         "skip_files": skip_files,
         "custom_dataset": custom_dataset,
     }
-    data_loader = load_next_files(**load_data_kwargs) 
+    load_next_files(**load_data_kwargs) 
     processed_batches = fast_forward_already_processed(num_of_processed_lines=num_of_processed_batches, **load_data_kwargs,)
     
     def next_data_batch():
         data = next(data_loader, None)
         if data is None:
-            load_next_files(dataset_dir, data_batch_size, skip_files, custom_dataset)
+            result = load_next_files(dataset_dir, data_batch_size, skip_files, custom_dataset)
+            if not result:
+                return None
             return next_data_batch()
         return data
 
@@ -88,6 +95,8 @@ def augment_db(
         print(f"Processing batch {processed_batches}", flush=True)
 
         input_data = next_data_batch()
+        if input_data is None:
+            break
         annotated_data, current_stats = toolformer(**input_data)
 
         print(f"Gnerated {len(annotated_data)} samples!!!!", flush=True)
@@ -112,7 +121,7 @@ def augment_db(
         torch.cuda.empty_cache()
 
 
-def load_model_and_tokenizer(model_name):
+def load_model_and_tokenizer(model_name, device=0):
     cache_dir = None
     cache_option = {} if cache_dir is None else {"cache_dir": cache_dir}
     
@@ -125,7 +134,7 @@ def load_model_and_tokenizer(model_name):
                 "EleutherAI/gpt-j-6B",
                 revision="float16",
                 torch_dtype=torch.float16,
-                low_cpu_mem_usage=True, config=config, **cache_option).cuda()
+                low_cpu_mem_usage=True, config=config, **cache_option).to(device)
 
     elif model_name == "LLAMA":
         tokenizer = LlamaTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf",
@@ -142,7 +151,7 @@ def load_model_and_tokenizer(model_name):
                                                   torch_dtype=torch.float16,
                                                   low_cpu_mem_usage=True,
                                                   config=config,
-                                                  **cache_option).cuda()
+                                                  **cache_option).to(device)
 
     elif model_name == "LLAMA-big":
         tokenizer = LlamaTokenizer.from_pretrained("meta-llama/Llama-2-70b-hf",
@@ -161,7 +170,7 @@ def load_model_and_tokenizer(model_name):
                                                   torch_dtype=torch.float16,
                                                   low_cpu_mem_usage=True,
                                                   config=config,
-                                                  **cache_option).cuda()
+                                                  **cache_option).to(device)
     elif model_name == "MISTRAL":
 
         tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", **cache_option)
@@ -170,8 +179,12 @@ def load_model_and_tokenizer(model_name):
         model = AutoModelForCausalLM.from_pretrained(
                 "mistralai/Mistral-7B-v0.1",
                 torch_dtype=torch.float16,
-                low_cpu_mem_usage=True, **cache_option).cuda()
+                low_cpu_mem_usage=True, **cache_option).to(device)
+    elif model_name == "MOCK":
+        tokenizer = MockTokenizer()
+        model = MockModel()
 
+    model = DDP(model, device_ids=[device], find_unused_parameters=True)
     return tokenizer,model
 
 def load_next_files(
@@ -185,18 +198,26 @@ def load_next_files(
     """
     global data_loader
     if custom_dataset is not None:
+        if data_loader is not None:
+            return False
         data_loader = DataLoader(custom_dataset, batch_size=data_batch_size)
+        
     else:
         file_list = [
             file
             for file in os.listdir(dataset_dir)
             if file.endswith(".csv") and file not in skip_files
         ]
-        file_batch = file_batch
+        if file_batch >= len(file_list):
+            return False
+
         dataset = load_dataset(dataset_dir, data_files=file_list[file_batch : file_batch + FILE_BATCH_SIZE])
 
         file_batch += FILE_BATCH_SIZE
         data_loader = DataLoader(dataset, batch_size=data_batch_size)
+
+    data_loader = iter(data_loader)
+    return True
 
 def fast_forward_already_processed(
         num_of_processed_lines: int = 0,
@@ -230,12 +251,12 @@ def save_stats(
         total_examples_dict = current_stats['Time key to example length for per example averaging']
         if key.startswith("Time"):
             stat_avgs[f"{key} average (per batch)"] = sum(stats_dict[key])/len(stats_dict[key])
-            print(f"{key} average (per batch): {stat_avgs[f"{key} average (per batch)"]}", flush=True)
-            logging.info(f"{key} average: {stat_avgs[f"{key} average (per batch)"]}")
+            print(f"{key} average (per batch): {stat_avgs[f'{key} average (per batch)']}", flush=True)
+            logging.info(f"{key} average: {stat_avgs[f'{key} average (per batch)']}")
             if key in total_examples_dict and total_examples_dict[key] > 0:
                 stat_avgs[f"{key} average (per example)"] = sum(stats_dict[key])/total_examples_dict[key]
-                print(f"{key} average (per example): {stat_avgs[f"{key} average (per example)"]}", flush=True)
-                logging.info(f"{key} average (per example): {stat_avgs[f"{key} average (per example)"]}")
+                print(f"{key} average (per example): {stat_avgs[f'{key} average (per example)']}", flush=True)
+                logging.info(f"{key} average (per example): {stat_avgs[f'{key} average (per example)']}")
         else:
             stat_avgs[key] = sum(stats_dict[key])/len(stats_dict[key])
             print(f"{key}: {stats_dict[key]}", flush=True)
@@ -314,3 +335,52 @@ def data_row(processed_data, raw_data, index):
             value = value.item() if value.numel() == 1 else value.tolist()
         new_row[key] = value
     return new_row
+
+class MockModelOutput():
+    def __init__(self, logits, hidden_states):
+        self.logits = logits
+        self.hidden_states = hidden_states
+        self.past_key_values = None
+
+    def to_tuple(self):
+        return self.logits, self.hidden_states
+
+class MockModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.pad_token_id = 0
+
+        # Define single parameter:
+        self.model = torch.nn.Linear(1, 1)
+        
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        return {"input_ids": args[0], "past_key_values": None, "attention_mask": torch.ones(args[0].shape)}
+
+    def cuda(self):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        # Return zeros of same shape as input_ids:
+        print(args, flush=True)
+        print(kwargs, flush=True)
+        return MockModelOutput(torch.zeros(kwargs["input_ids"].shape + (50257,)), None)
+    
+
+class MockTokenizer():
+    def __init__(self):
+        self.pad_token_id = 0
+        self.pad_token = "0"
+        self.eos_token = "eos"
+        self.eos_token_id = 1
+    
+    def encode(self, text, **kwargs):
+        if len(text) < 6:
+            return [3]
+        
+        return [1, 2, 3]
+    
+    def decode(self, ids, **kwargs):
+        return "decoded"
+    
+    def get_vocab(self):
+        return {"[PAD]": 0, "[EOS]": 1, "[BOS]": 2, "[SEP]": 3}

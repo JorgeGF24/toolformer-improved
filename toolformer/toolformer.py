@@ -952,21 +952,22 @@ class Toolformer(nn.Module):
     @torch.no_grad()
     def forward(
         self,
-        data: List[str],
-        additional_input=None
+        text: List[str],
+        date: List[str] | None = None,
+        **kwargs
     ):
         
         print("FORWARD", flush=True)
         logging.info(f"FORWARD")
         self.model.eval()
         start_total_time = time.time()
-        print(f"Received a batch of size {len(data)}", flush=True)
+        print(f"Received a batch of size {len(text)}", flush=True)
 
-        new_to_old_idx = [i for i in range(len(data))]
+        new_to_old_idx = [i for i in range(len(text))]
 
         # We load the data substituted into the prompt so that the model samples appropriate positions for API calls
         dataset = PromptDataset(
-            data=data,
+            data=text,
             tokenized_raw_prompt=self.tokenized_raw_prompt,
             tokenized_arg_prompt=self.tokenized_raw_arg_prompt,
             substitute_index=self.substitute_index,
@@ -1279,7 +1280,7 @@ class Toolformer(nn.Module):
             
             response = None
             try:
-                argv = additional_input[new_to_old_idx[call.data_idx]] if additional_input else None
+                argv = date[new_to_old_idx[call.data_idx]] if date else None
                 response = self.tool(args, argv)
                 if isinstance(response, float): response = str(response)
                 assert isinstance(response, str), f"API response has type {type(response)} is not a string"
