@@ -194,7 +194,7 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def experiment(name, rank, world_size):
+def experiment(rank, name, world_size):
 
     setup(rank, world_size)
 
@@ -224,7 +224,7 @@ def experiment(name, rank, world_size):
         'extra_data_columns': ['date'],
         'new_data_columns': new_columns,
         'filter_threshold': 0.2,
-        'device': rank,
+        'device': rank if device_count() > 0 else "cpu",
         'world_size': world_size
     }
 
@@ -241,7 +241,7 @@ def experiment(name, rank, world_size):
         'new_data_columns': new_columns,
         'sampling_temperature': 0.5,
         'filter_threshold': 0.2,
-        'device': rank,
+        'device': rank if device_count() > 0 else "cpu",
         'world_size': world_size
     }
 
@@ -257,7 +257,7 @@ def experiment(name, rank, world_size):
         'new_data_columns': new_columns,
         'sampling_temperature': 0.5,
         'filter_threshold': 0.5,
-        'device': rank,
+        'device': rank if device_count() > 0 else "cpu",
         'world_size': world_size
     }
 
@@ -549,7 +549,7 @@ def experiment(name, rank, world_size):
 if __name__ == "__main__":
     name = sys.argv[2] if len(sys.argv) > 2 else "Lightweight pipeline test"
     number_of_processes = device_count() or 1
-    mp.spawn(experiment, args=(int(sys.argv[1]), 2), nprocs=2, join=True)
+    mp.spawn(experiment, args=(name, number_of_processes,), nprocs=number_of_processes)
     #experiment("Comparing max logits")
     #experiment("Lightweight pipeline test")
     #experiment("Continue GPTJ WikiSearch")

@@ -44,7 +44,7 @@ def augment_db(
     stats_num = len([file for file in os.listdir(os.path.join(augment_dir,"stats")) if file.startswith("stats")])
     
     if previous_model != model_name:
-        tokenizer, model = load_model_and_tokenizer(model_name, device=device)
+        tokenizer, model = load_model_and_tokenizer(model_name, device=device, world_size=world_size)
 
         arg_gen_stoppers = []
         for k, v in tokenizer.get_vocab().items():
@@ -121,7 +121,7 @@ def augment_db(
         torch.cuda.empty_cache()
 
 
-def load_model_and_tokenizer(model_name, device=0):
+def load_model_and_tokenizer(model_name, device=0, world_size=1):
     cache_dir = None
     cache_option = {} if cache_dir is None else {"cache_dir": cache_dir}
     
@@ -184,7 +184,8 @@ def load_model_and_tokenizer(model_name, device=0):
         tokenizer = MockTokenizer()
         model = MockModel()
 
-    model = DDP(model, device_ids=[device], find_unused_parameters=True)
+    if world_size > 1:
+        model = DDP(model, device_ids=[device], find_unused_parameters=True)
     return tokenizer,model
 
 def load_next_files(
