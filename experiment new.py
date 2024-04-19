@@ -5,6 +5,7 @@ import sys
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.cuda import device_count
+from torch import device
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -216,7 +217,7 @@ def experiment(rank, name, world_size):
         'dataset_dir': "/vol/bitbucket/jg2619/data/preprocessed/big_load/calendar",
         'augment_dir': "/vol/bitbucket/jg2619/data/augmented2/calendar3",
         'max_args_length': 0,
-        'max_data_length': 256,
+        'max_data_length': 450,
         'k_positions': 8,
         'm_arg_samples': 1,
         'prompt_batch_size': 104,
@@ -224,7 +225,7 @@ def experiment(rank, name, world_size):
         'extra_data_columns': ['date'],
         'new_data_columns': new_columns,
         'filter_threshold': 0.2,
-        'device': rank if device_count() > 0 else "cpu",
+        'device': device(f'cuda:{rank}') if device_count() > 0 else device("cpu"),
         'world_size': world_size
     }
 
@@ -235,13 +236,13 @@ def experiment(rank, name, world_size):
         'preprocess_args': wiki_parse,
         'raw_tool_prompt': wikipedia_search_prompt,
         'max_args_length': 12,
-        'max_data_length': 150,
+        'max_data_length': 406,
         'response_length': 75,
         'extra_data_columns': [],
         'new_data_columns': new_columns,
         'sampling_temperature': 0.5,
         'filter_threshold': 0.2,
-        'device': rank if device_count() > 0 else "cpu",
+        'device': device(f'cuda:{rank}') if device_count() > 0 else device("cpu"),
         'world_size': world_size
     }
 
@@ -252,12 +253,12 @@ def experiment(rank, name, world_size):
         'preprocess_args': calc_parse,
         'raw_tool_prompt': calculator_prompt,
         'max_args_length': 30,
-        'max_data_length': 180,
+        'max_data_length': 436,
         'extra_data_columns': [],
         'new_data_columns': new_columns,
         'sampling_temperature': 0.5,
         'filter_threshold': 0.5,
-        'device': rank if device_count() > 0 else "cpu",
+        'device': device(f'cuda:{rank}') if device_count() > 0 else device("cpu"),
         'world_size': world_size
     }
 
@@ -266,8 +267,8 @@ def experiment(rank, name, world_size):
         case "Comparing probabilities":
             print("Comparing probabilities...", flush=True)
             config = wiki_default_config | {
-                'dataset_dir': '/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/data/preprocessed/big_load_shuffled_nonewlines/wikiSearch',
-                'augment_dir': '/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/toolformer-luci/compare_probs',
+                'dataset_dir': 'jorgeegf/toolformerselection',
+                'augment_dir': '/home/ubuntu/toolformer-improved/data/compare_probs',
                 'm_arg_samples': 5,
                 'prompt_batch_size': 64,
                 'filtering_batch_size': 512,
@@ -275,10 +276,10 @@ def experiment(rank, name, world_size):
                 'erase': True,
                 # 'skip_files': ["0.csv"],
                 # 'num_of_processed_batches':3,
-                'model_name': "GPTJ",    # GPTJ or LLAMA
+                'model_name': "mistralai/mistral-7B-v0.1",    # GPTJ or LLAMA
                 'debug_level': 2,
                 # 'custom_dataset': data,
-                # 'data_batch_size': 14
+                'data_batch_size': 64
             }
 
             print("\n CONFIG >>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
@@ -309,15 +310,15 @@ def experiment(rank, name, world_size):
         case "Lightweight pipeline test":
             print("TESTING PIPELINE STANDARD arg prompt...", flush=True)
             config = wiki_default_config | {
-                'dataset_dir': '/home/jorge/ccnet/merged/processed/wikiSearch',
-                'augment_dir': '/home/jorge/toolformer-improved/data/debug',
+                'dataset_id': 'jorgeegf/toolformerselection',
+                'augment_dir': '/home/ubuntu/toolformer-improved/data/debug',
                 'm_arg_samples': 5,
                 'prompt_batch_size': int(202*size_factor),
                 'filtering_batch_size': int(6000*size_factor),
                 # 'raw_arg_prompt': wikipedia_arg_prompt,
                 # 'skip_files': ["0.csv"],
                 # 'num_of_processed_batches':3,
-                'model_name': "MOCK",    # GPTJ or LLAMA
+                'model_name': "mistralai/Mistral-7B-v0.1",# "sshleifer/tiny-gpt2", #    # GPTJ or LLAMA
                 'debug_level': 2,
                 'custom_dataset': data,
                 # 'data_batch_size': 14
@@ -374,16 +375,19 @@ def experiment(rank, name, world_size):
 
         case "Experiment 1":
             print(
-                "Augmenting wikipedia data with SEPARATE arg prompt and 0.9 temperature...", flush=True)
-            config = wiki_default_config | {
-                'dataset_dir': '/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/data/preprocessed/big_load_reverse/wikiSearch',
-                'augment_dir': '/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/data/augmented_standard/wikiSearch',
-                'm_arg_samples': 8,
-                'prompt_batch_size': 64,
-                'filtering_batch_size': 256,
-                'raw_arg_prompt': wikipedia_arg_prompt,
+                "Augmenting calculator data with SEPARATE arg prompt and 0.9 temperature...", flush=True)
+            config = calc_default_config | {
+                'dataset_id': 'jorgeegf/toolformerselection',
+                'augment_dir': '/home/ubuntu/toolformer-improved/data/test2',
+                'm_arg_samples': 6,
+                'k_positions': 15,
+                'model_name': "mistralai/Mistral-7B-v0.1",
+                'prompt_batch_size': 231,
+                'pos_threshold': 0.07,
+                'filtering_batch_size': 512,
+                'raw_arg_prompt': calculator_arg_prompt,
             }
-            augment_wiki(config)
+            augment_calc(config)
 
         case "LLAMA Calculator":
             print("Augmenting calculator data with STANDARD arg prompt...")
@@ -547,7 +551,7 @@ def experiment(rank, name, world_size):
 
 
 if __name__ == "__main__":
-    name = sys.argv[2] if len(sys.argv) > 2 else "Lightweight pipeline test"
+    name = sys.argv[2] if len(sys.argv) > 2 else "Experiment 1"
     number_of_processes = device_count() or 1
     mp.spawn(experiment, args=(name, number_of_processes,), nprocs=number_of_processes)
     #experiment("Comparing max logits")

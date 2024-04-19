@@ -1,6 +1,7 @@
 from csv import QUOTE_ALL, DictWriter, QUOTE_MINIMAL
 import os
 import logging
+import random
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM, LlamaTokenizer, GPTJConfig, LlamaConfig
 import torch
@@ -23,7 +24,8 @@ data_loader = None
 
 @beartype
 def augment_db(
-    dataset_dir,
+    dataset_id: str,
+    tool_name: str,
     augment_dir,
     data_batch_size=1000,
     num_of_processed_batches=0,
@@ -32,47 +34,43 @@ def augment_db(
     model_name:str="GPTJ",  # "GPTJ" or "LLAMA",
     experiment_config:dict={},
     generated_so_far=0,
-    device="cuda",
+    device=torch.device('cuda'),
     world_size=1,
     **kwargs,
 ):
     global data_loader, file_batch, stats_num
-    previous_model = None
+    dataset_id = dataset_id.lower()
+    model_name = model_name.upper()
+
+    data_batch_size = kwargs.get("prompt_batch_size", data_batch_size//10)*10
 
     file_batch = 0
     os.makedirs(augment_dir + "/stats", exist_ok=True)
     stats_num = len([file for file in os.listdir(os.path.join(augment_dir,"stats")) if file.startswith("stats")])
-    
-    if previous_model != model_name:
-        tokenizer, model = load_model_and_tokenizer(model_name, device=device, world_size=world_size)
 
-        arg_gen_stoppers = []
-        for k, v in tokenizer.get_vocab().items():
-            if ']' in k or '→' in k or ')' in k:
-                arg_gen_stoppers.append(v)
-
-    previous_model = model_name
             
     # Task should have tf_kwargs with:
     # max_args_length, max_data_length, response_length, m_arg_samples, prompt_batch_size, filtering_batch_size, raw_tool_prompt, tool_name, tool, tool_check_duplicates, debug_level
     # Initialize the Toolformer
     toolformer = Toolformer(
-        model=model,
-        pad_token = tokenizer.pad_token,
-        tokenizer_encode=tokenizer.encode,
-        tokenizer_decode=tokenizer.decode,
+        model_name=model_name,
+        tool_name=tool_name,
         log_dir=augment_dir + "/logs",
-        arg_gen_stoppers=torch.Tensor(arg_gen_stoppers),
         experiment_config=experiment_config,
         using_llama= model_name == "LLAMA",
+        device=device,
+        world_size=world_size,
         **kwargs
     )
     
     load_data_kwargs = {
-        "dataset_dir": dataset_dir,
+        "dataset_id": dataset_id,
+        "tool_name": tool_name,
         "data_batch_size": data_batch_size,
         "skip_files": skip_files,
         "custom_dataset": custom_dataset,
+        "world_size": world_size,
+        "rank": device.index,
     }
     load_next_files(**load_data_kwargs) 
     processed_batches = fast_forward_already_processed(num_of_processed_lines=num_of_processed_batches, **load_data_kwargs,)
@@ -80,7 +78,7 @@ def augment_db(
     def next_data_batch():
         data = next(data_loader, None)
         if data is None:
-            result = load_next_files(dataset_dir, data_batch_size, skip_files, custom_dataset)
+            result = load_next_files(**load_data_kwargs)
             if not result:
                 return None
             return next_data_batch()
@@ -89,7 +87,11 @@ def augment_db(
     
     # Create a list to store the augmented records
     stats_dict = {}
-    generated_samples = generated_so_far
+    if os.path.exists(f"{augment_dir}/count_stats.csv"):
+        with open(f"{augment_dir}/count_stats.csv", 'r') as f:
+            generated_samples = int(f.readline().strip().split(",")[0])
+    else:
+        generated_samples = 0
     
     while generated_samples < GENERATION_TARGET:
         print(f"Processing batch {processed_batches}", flush=True)
@@ -105,11 +107,14 @@ def augment_db(
             print(row['loss_improvement'])
             print()
 
-        save_stats(current_stats, stats_dict, augment_dir)
+        save_stats(current_stats, stats_dict, augment_dir, device.index)
 
-        save_generated_data(input_data, annotated_data, augment_dir)
+        save_generated_data(input_data, annotated_data, augment_dir, device.index)
+
+        if os.path.exists(f"{augment_dir}/count_stats.csv"):
+            with open(f"{augment_dir}/count_stats.csv", 'r') as f:
+                generated_samples = int(f.readline().strip().split(",")[0])
         generated_samples += len(annotated_data)
-
         with open(f"{augment_dir}/count_stats.csv", 'w') as f:
             f.write(f"{generated_samples},{processed_batches}\n")
 
@@ -120,99 +125,75 @@ def augment_db(
         # Empty cuda cache
         torch.cuda.empty_cache()
 
+class Partition(object):
 
-def load_model_and_tokenizer(model_name, device=0, world_size=1):
-    cache_dir = None
-    cache_option = {} if cache_dir is None else {"cache_dir": cache_dir}
-    
-    if model_name == "GPTJ":
-        tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-j-6B", truncate=True, max_length=270, **cache_option)
-        tokenizer.pad_token=tokenizer.eos_token
-        config = GPTJConfig.from_pretrained("EleutherAI/gpt-j-6B", padding_idx=tokenizer.pad_token_id)
+    def __init__(self, data, index):
+        self.data = data
+        self.index = index
 
-        model = AutoModelForCausalLM.from_pretrained(
-                "EleutherAI/gpt-j-6B",
-                revision="float16",
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True, config=config, **cache_option).to(device)
+    def __len__(self):
+        return len(self.index)
 
-    elif model_name == "LLAMA":
-        tokenizer = LlamaTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf",
-                                                   token="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",
-                                                   **cache_option)
+    def __getitem__(self, index):
+        data_idx = self.index[index]
+        return self.data[data_idx]
 
-        tokenizer.add_bos_token = False
+class DataPartitioner(object):
+
+    def __init__(self, data, sizes=[0.7, 0.2, 0.1], seed=1234, full_dataset = False):
+        self.data = data
+        if full_dataset or all([sizes[i] == 1.0 for i in range(len(sizes))]):
+            self.full_dataset = True
+            self.partitions = [[x for x in range(0, len(data))]]
+            return
         
-        config = LlamaConfig.from_pretrained("meta-llama/Llama-2-7b-hf", 
-                                             token="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",
-                                             padding_idx=tokenizer.pad_token_id)
-        model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf",
-                                                  token="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",
-                                                  torch_dtype=torch.float16,
-                                                  low_cpu_mem_usage=True,
-                                                  config=config,
-                                                  **cache_option).to(device)
+        self.full_dataset = False
+        self.partitions = []
+        rng = random.Random()
+        rng.seed(seed)
+        data_len = len(data)
+        indexes = [x for x in range(0, data_len)]
+        rng.shuffle(indexes)
 
-    elif model_name == "LLAMA-big":
-        tokenizer = LlamaTokenizer.from_pretrained("meta-llama/Llama-2-70b-hf",
-                                                   token="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",
-                                                   **cache_option)
+        for frac in sizes:
+            part_len = int(frac * data_len)
+            self.partitions.append(indexes[0:part_len])
+            indexes = indexes[part_len:]
 
-        tokenizer.add_bos_token = False
-
-        #tokenizer.add_tokens(["[PAD]"])
-        
-        config = LlamaConfig.from_pretrained("meta-llama/Llama-2-70b-hf", 
-                                             token="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",
-                                             padding_idx=tokenizer.pad_token_id)
-        model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-70b-hf",
-                                                  token="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",
-                                                  torch_dtype=torch.float16,
-                                                  low_cpu_mem_usage=True,
-                                                  config=config,
-                                                  **cache_option).to(device)
-    elif model_name == "MISTRAL":
-
-        tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", **cache_option)
-        tokenizer.pad_token=tokenizer.eos_token
-
-        model = AutoModelForCausalLM.from_pretrained(
-                "mistralai/Mistral-7B-v0.1",
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True, **cache_option).to(device)
-    elif model_name == "MOCK":
-        tokenizer = MockTokenizer()
-        model = MockModel()
-
-    if world_size > 1:
-        model = DDP(model, device_ids=[device], find_unused_parameters=True)
-    return tokenizer,model
+    def use(self, partition):
+        if self.full_dataset:
+            partition = 0
+        return Partition(self.data, self.partitions[partition])
 
 def load_next_files(
-    dataset_dir: str,
+    dataset_id: str,
+    tool_name: str,
     data_batch_size: int = 128,
     skip_files: list[str] = [],
     custom_dataset: Dataset | None = None,
+    world_size: int = 1,
+    rank: int = 0,
 ):
     """
     Load the next batch of files from the dataset directory, or custom dataset.
     """
-    global data_loader
+    global data_loader, file_batch
+    tool_name = tool_name[0].lower() + tool_name[1:]
+
     if custom_dataset is not None:
         if data_loader is not None:
             return False
         data_loader = DataLoader(custom_dataset, batch_size=data_batch_size)
-        
     else:
         file_list = [
-            file
-            for file in os.listdir(dataset_dir)
+            os.path.join(tool_name, file)
+            for file in os.listdir(os.path.join("data", dataset_id, tool_name))
             if file.endswith(".csv") and file not in skip_files
         ]
         if file_batch >= len(file_list):
             return False
 
-        dataset = load_dataset(dataset_dir, data_files=file_list[file_batch : file_batch + FILE_BATCH_SIZE])
+        dataset = DataPartitioner(load_dataset(dataset_id, data_files=file_list[file_batch : file_batch + FILE_BATCH_SIZE], split="train"), sizes=[1.0/world_size]*world_size).use(rank)
 
         file_batch += FILE_BATCH_SIZE
         data_loader = DataLoader(dataset, batch_size=data_batch_size)
@@ -241,6 +222,7 @@ def save_stats(
     current_stats: dict,
     stats_dict: dict,
     augment_dir: str,
+    rank: int = 0,
 ):
     stat_avgs = {}
     for key in current_stats:
@@ -265,12 +247,12 @@ def save_stats(
 
     # Number of files in augment_dir that start with stats:
     add_header = not os.path.exists(f"{augment_dir}/stats/stats_{stats_num}.csv")
-    with open(f"{augment_dir}/stats/stats_{stats_num}.csv", "w") as f:
+    with open(f"{augment_dir}/stats/stats_{stats_num}_{rank}.csv", "w") as f:
         writer = DictWriter(f, fieldnames=stats_dict.keys(), quoting=QUOTE_MINIMAL)
         if add_header:
             writer.writeheader()
         writer.writerow(stats_dict)
-    with open(f"{augment_dir}/stats/stats_{stats_num}_avgs.csv", "w") as f:
+    with open(f"{augment_dir}/stats/stats_{stats_num}_{rank}_avgs.csv", "w") as f:
         writer = DictWriter(f, fieldnames=stat_avgs.keys(), quoting=QUOTE_MINIMAL)
         if add_header:
             writer.writeheader()
@@ -284,14 +266,15 @@ def save_generated_data(
     raw_data,
     annotated_data: list[dict],
     augment_dir: str,
+    rank: int = 0,
 ):
     if len(annotated_data) == 0:
         return
 
     def file_path(file_counter):
-        return f"{augment_dir}/augmented_data_{file_counter}.csv"
+        return f"{augment_dir}/augmented_data_{file_counter}_{rank}.csv"
 
-    file_counter = len([file for file in os.listdir(augment_dir) if file.endswith('.csv') and not "stats" in file]) - 1
+    file_counter = len([file for file in os.listdir(augment_dir) if file.endswith('.csv') and not "stats" in file])
     if os.path.exists(file_path(file_counter)):
         with open(file_path(file_counter), "r") as f:
             file_lines = len(f.readlines())
@@ -300,7 +283,11 @@ def save_generated_data(
             file_counter += 1
             
     # DONT ELSE, IN CASE WE UP-ED THE COUNTER
-    processed_data_cols = raw_data.keys() + annotated_data[0].keys()
+    print(f"Raw data keys: {raw_data.keys()}", flush=True)
+    print(f"Annotated data keys: {annotated_data[0].keys()}", flush=True)
+    processed_data_cols = set(raw_data.keys()) | set(annotated_data[0].keys())
+    processed_data_cols.discard("index")
+    processed_data_cols = list(processed_data_cols)
     if not os.path.exists(file_path(file_counter)):
         with open(file_path(file_counter), 'w') as f:
             writer = DictWriter(f, fieldnames = processed_data_cols, quoting=QUOTE_ALL)
@@ -309,6 +296,7 @@ def save_generated_data(
     augmented_rows = []
     for row in annotated_data:
         augmented_rows.append(data_row(row, raw_data, row['index']))
+        print(f"Just appended {augmented_rows[-1]}", flush=True)
 
     with open(file_path(file_counter), 'a') as f:
         logging.info(f"Writing results to {file_path(file_counter)}")
@@ -336,52 +324,3 @@ def data_row(processed_data, raw_data, index):
             value = value.item() if value.numel() == 1 else value.tolist()
         new_row[key] = value
     return new_row
-
-class MockModelOutput():
-    def __init__(self, logits, hidden_states):
-        self.logits = logits
-        self.hidden_states = hidden_states
-        self.past_key_values = None
-
-    def to_tuple(self):
-        return self.logits, self.hidden_states
-
-class MockModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.pad_token_id = 0
-
-        # Define single parameter:
-        self.model = torch.nn.Linear(1, 1)
-        
-    def prepare_inputs_for_generation(self, *args, **kwargs):
-        return {"input_ids": args[0], "past_key_values": None, "attention_mask": torch.ones(args[0].shape)}
-
-    def cuda(self):
-        return self
-
-    def __call__(self, *args, **kwargs):
-        # Return zeros of same shape as input_ids:
-        print(args, flush=True)
-        print(kwargs, flush=True)
-        return MockModelOutput(torch.zeros(kwargs["input_ids"].shape + (50257,)), None)
-    
-
-class MockTokenizer():
-    def __init__(self):
-        self.pad_token_id = 0
-        self.pad_token = "0"
-        self.eos_token = "eos"
-        self.eos_token_id = 1
-    
-    def encode(self, text, **kwargs):
-        if len(text) < 6:
-            return [3]
-        
-        return [1, 2, 3]
-    
-    def decode(self, ids, **kwargs):
-        return "decoded"
-    
-    def get_vocab(self):
-        return {"[PAD]": 0, "[EOS]": 1, "[BOS]": 2, "[SEP]": 3}

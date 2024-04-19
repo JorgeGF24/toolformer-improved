@@ -15,3 +15,12 @@ Max of list
 GPTJ_lengths: 66
 Min of list
 GPTJ_lengths: 1
+
+Average of list
+MISTRAL_values: 0.3133735305898299
+Standard deviation of list
+MISTRAL_values: 0.16855841875076294
+Max of list
+MISTRAL_values: 0.999739944934845
+Min of list
+MISTRAL_values: 0.000552660902030766

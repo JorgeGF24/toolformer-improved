@@ -14,6 +14,7 @@ from torch import tensor as Tensor
 from functools import partial
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModelForCausalLM, GPTJConfig, LlamaTokenizer, LlamaConfig, LlamaForCausalLM, PreTrainedTokenizer
 
 from einops import rearrange
 
@@ -23,6 +24,7 @@ from beartype.typing import Callable, Optional, Union, List, Tuple, Dict
 from tqdm import tqdm
 
 import logging
+
 
 pad_sequence = partial(pad_sequence, batch_first=True)
 
@@ -49,13 +51,12 @@ DEVICE = 'cpu'
 TRUNCATE_LENGTH = 100
 MAX_RESPONSE_LENGTH = 50
 MASKED_ARG_GENERATION = True
-LLAMA = False
 BOS_ID = 1
 FILTER_THRESHOLD_EXPERIMENT = False
 FILTER_STEP = 1/5  # the denominator is the number of tokens to consider before filtering to 0
 
 
-CACHE_DIR = "/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/toolformer/cache"
+CACHE_DIR = None
 
 
 # tensor helpers
@@ -63,11 +64,9 @@ CACHE_DIR = "/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/toolf
 
 def log(t, eps=1e-20): return t.clamp(min=eps).log()
 
-
 def gumbel_noise(t):
     noise = torch.zeros_like(t).uniform_(0, 1)
     return -log(-log(noise))
-
 
 def gumbel_sample(t, temperature=1., dim=-1, eps=1e-10):
     # Returns flat vector
@@ -75,9 +74,6 @@ def gumbel_sample(t, temperature=1., dim=-1, eps=1e-10):
         return t.argmax(dim=dim)
 
     return ((t / max(temperature, eps)) + gumbel_noise(t)).argmax(dim=dim)
-
-
-# the main contribution of the paper is simply the filtering equations presented in section 2
 
 
 def default_weight_fn(t):
@@ -144,6 +140,55 @@ def weight_and_mask(
 # for bootstrapping the initial datasets with api calls
 # as well as for the final finetuning
  
+
+class MockModelOutput():
+    def __init__(self, logits, hidden_states):
+        self.logits = logits
+        self.hidden_states = hidden_states
+        self.past_key_values = None
+
+    def to_tuple(self):
+        return self.logits, self.hidden_states
+
+class MockModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.pad_token_id = 0
+
+        # Define single parameter:
+        self.model = torch.nn.Linear(1, 1)
+        
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        return {"input_ids": args[0], "past_key_values": None, "attention_mask": torch.ones(args[0].shape)}
+
+    def cuda(self):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        # Return zeros of same shape as input_ids:
+        print(args, flush=True)
+        print(kwargs, flush=True)
+        return MockModelOutput(torch.zeros(kwargs["input_ids"].shape + (50257,)), None)
+    
+
+class MockTokenizer():
+    def __init__(self):
+        self.pad_token_id = 0
+        self.pad_token = "0"
+        self.eos_token = "eos"
+        self.eos_token_id = 1
+    
+    def encode(self, text, **kwargs):
+        if len(text) < 6:
+            return [3]
+        
+        return [1, 2, 3]
+    
+    def decode(self, ids, **kwargs):
+        return "decoded"
+    
+    def get_vocab(self):
+        return {"[PAD]": 0, "[EOS]": 1, "[BOS]": 2, "[SEP]": 3}
 
 @beartype
 class PromptDataset(Dataset):
@@ -255,13 +300,10 @@ class APICallDataset(Dataset):
         return self.data[data_idx], data_with_call, data_with_call_resp, pos, pos_call_end, pos_resp_end, call['output_clean_format'].cpu(), call_resp['output_clean_format'].cpu(), data_idx, call_idx
 
 def API_collate_fn(data):
-    global PAD_ID, LLAMA, BOS_ID
+    global PAD_ID, BOS_ID
     data_plain, data_api, data_api_resp, pos, pos_call_end, pos_resp_end, calls, call_resps, data_indices, call_indices = zip(*data)
 
     position_triplet = tuple([Tensor(x) for x in (pos, pos_call_end, pos_resp_end)])
-    if LLAMA:
-        # Add 1 to the positions to account for bos that we'll add during the padding stage
-        position_triplet = tuple([x+1 for x in position_triplet])
 
     return (data_plain, data_api, data_api_resp), position_triplet, tuple([list(calls), list(call_resps)]), data_indices, call_indices
 
@@ -315,17 +357,17 @@ class ArgString():
 class Toolformer(nn.Module):
     def __init__(
         self,
-        model: nn.Module,
+        model: nn.Module = None,
+        tokenizer: PreTrainedTokenizer = None,
+        model_name: str = None,
         *,
         tool_name: str,
         tool: Callable,
         tool_check_duplicates: Callable,
-        tokenizer_encode: Callable,
-        tokenizer_decode: Callable,
         raw_tool_prompt: str,
+        tool_num_responses: int = 1,
         raw_arg_prompt: str=None,
         preprocess_args: Callable=None,
-        pad_token=PAD_TOKEN,
         api_start_token=API_START_TOKEN,
         api_end_token=API_END_TOKEN,
         filter_threshold=1.,
@@ -339,16 +381,13 @@ class Toolformer(nn.Module):
         sampling_temperature=1.,
         max_data_length=100,
         model_seq_len=2048,  # POTENTIALLY REMOVE
-        tokenizer_batch_decode: Callable = None,
         softer_weight:bool=False,
         debug_level:int=1,  # 0 is only info, 1 is more detail, 2 is excruciating detail
         log_dir:str="/vol/bitbucket/jg2619/augmenting_llms/augmented_data_pipeline/toolformer-luci/lost_logs",
-        using_llama:bool=False,
-        bos_id:int=1,
         experiment_config:Dict={},
-        arg_gen_stoppers:torch.Tensor=None,
         batch_size_decrease_step:int=7,
         max_cuda_error_count:int=50,
+        device:Union[int, str, torch.device] = torch.device("cpu"),
         **kwargs
     ):
         super().__init__()
@@ -356,20 +395,23 @@ class Toolformer(nn.Module):
         for key in kwargs.keys():
             print(f"WARNING: {key} is not used in Toolformer")
 
-        global FILTER_STEP, BOS_ID, LLAMA, MASKED_ARG_GENERATION, API_START_TOKEN, API_START_ID, API_END_TOKEN, API_END_ID, ARG_GEN_STOPPERS, DELIMITER_ID, PAD_ID, PAD_TOKEN, DECODE, ENCODE, DEVICE, TRUNCATE_LENGTH, MAX_RESPONSE_LENGTH
+        global FILTER_STEP, BOS_ID, MASKED_ARG_GENERATION, API_START_TOKEN, API_START_ID, API_END_TOKEN, API_END_ID, ARG_GEN_STOPPERS, DELIMITER_ID, PAD_ID, PAD_TOKEN, DECODE, ENCODE, DEVICE, TRUNCATE_LENGTH, MAX_RESPONSE_LENGTH
 
-        self.model = model
+        assert model is not None or model_name is not None, "Either model or model_name must be provided"
+        if model is not None:
+            self.model = model
+            self.tokenizer = tokenizer
+            assert tokenizer is not None, "Tokenizer must be provided if model is provided"
+        else:
+            self.model, self.tokenizer = self.load_model_and_tokenizer(model_name, device)
         self.model_seq_len = model_seq_len
-        self.device = next(self.model.parameters()).device
+        self.device = device
         DEVICE = self.device
         
-        LLAMA = using_llama
-        if using_llama:
-            self.bos_id = bos_id
-            BOS_ID = bos_id
+        BOS_ID = self.tokenizer.bos_token_id
+        if "llama" in model_name.lower() or "mistral" in model_name.lower():
             FILTER_STEP = 1/7
 
-            
         self.debug_level = debug_level
         # Create log dir
         if not os.path.exists(log_dir):
@@ -387,18 +429,16 @@ class Toolformer(nn.Module):
         self.BATCH_SIZE_DECREASE_STEP = batch_size_decrease_step
         self.MAX_CUDA_ERROR_COUNT = max_cuda_error_count
         
-        self.encode = tokenizer_encode
-        self.decode = tokenizer_decode
-        DECODE = tokenizer_decode # FOR DEBBUGING
-        ENCODE = tokenizer_encode # FOR DEBBUGING
+        self.encode = self.tokenizer.encode
+        self.decode = self.tokenizer.decode
+        DECODE = self.decode # FOR DEBBUGING
+        ENCODE = self.encode # FOR DEBBUGING
         TRUNCATE_LENGTH = max_data_length
         MAX_RESPONSE_LENGTH = max_response_length
 
-        if tokenizer_batch_decode is None:
-            tokenizer_batch_decode = lambda data_list: [self.decode(data) for data in data_list]
-        self.batch_decode = tokenizer_batch_decode
+
         self.encode_to_tensor = lambda s: Tensor(
-            tokenizer_encode(s)).long()
+            self.encode(s)).long()
 
         self.filter_threshold = filter_threshold
         self.pos_threshold = pos_threshold
@@ -412,12 +452,17 @@ class Toolformer(nn.Module):
         #self.API_END_TOKEN = API_END_TOKEN
         #self.api_response_delimiter = api_response_delimiter
         
-        PAD_TOKEN = pad_token
-        PAD_ID = ENCODE(pad_token)
+        PAD_TOKEN = self.tokenizer.pad_token
+        PAD_ID = ENCODE(PAD_TOKEN)
         assert len(PAD_ID) == 1
         PAD_ID = PAD_ID[0]
 
-        if LLAMA and api_start_token[0] == ' ':
+        def remove_space_check():
+            prompt_tokens = self.encode("a dog [is")
+            assert "dog" in self.decode([prompt_tokens[1]]) and self.decode([prompt_tokens[2]])[-1] == "["
+            return self.decode([prompt_tokens[2]])[0] != " "
+        
+        if remove_space_check() and api_start_token[0] == ' ':
             # Remove space from api start token
             api_start_token = api_start_token[1:]
         API_START_TOKEN = api_start_token
@@ -430,19 +475,22 @@ class Toolformer(nn.Module):
         assert len(API_END_ID) == 1
         API_END_ID = API_END_ID[0]
 
-        if arg_gen_stoppers is not None:
-            ARG_GEN_STOPPERS = arg_gen_stoppers.long().to(self.device)
-        else:
-            ARG_GEN_STOPPERS = Tensor([ENCODE(token)[-1] for token in ARG_GEN_STOP_TOKENS if len(ENCODE(token))==1], device=self.device).long()
-        DELIMITER_ID = tokenizer_encode(DELIMITER_TOKEN)
+        arg_gen_stoppers = []
+        for k, v in self.tokenizer.get_vocab().items():
+            if ']' in k or '→' in k or ')' in k:
+                arg_gen_stoppers.append(v)
+        ARG_GEN_STOPPERS = Tensor(arg_gen_stoppers).long().to(self.device)
+            
+        DELIMITER_ID = self.encode(DELIMITER_TOKEN)
         assert len(DELIMITER_ID) == 1
         DELIMITER_ID = DELIMITER_ID[0]
 
         self.tool_name = tool_name
         self.tool = tool
-        self.tokenized_tool_name = tokenizer_encode(tool_name)
+        self.tokenized_tool_name = self.encode(tool_name)
         self.tool_check_duplicates = tool_check_duplicates
         self.preprocess_args = preprocess_args
+        self.tool_num_responses = tool_num_responses
 
         self.raw_tool_prompt = raw_tool_prompt
         
@@ -452,13 +500,13 @@ class Toolformer(nn.Module):
         else:
             logging.info("MASKED ARG GENERATION")
             MASKED_ARG_GENERATION = True
-        raw_tool_prompt = raw_tool_prompt.replace("[PAD]", pad_token)
+        raw_tool_prompt = raw_tool_prompt.replace("[PAD]", PAD_TOKEN)
         self.raw_arg_prompt = raw_arg_prompt
-        self.tokenized_raw_prompt = tokenizer_encode(raw_tool_prompt)
-        self.tokenized_raw_arg_prompt = tokenizer_encode(raw_arg_prompt)
-        if using_llama:
-            self.tokenized_raw_prompt = [self.bos_id] + self.tokenized_raw_prompt
-            self.tokenized_raw_arg_prompt = [self.bos_id] + self.tokenized_raw_arg_prompt
+        self.tokenized_raw_prompt = self.encode(raw_tool_prompt)
+        self.tokenized_raw_arg_prompt = self.encode(raw_arg_prompt)
+        if self.add_bos_token:
+            self.tokenized_raw_prompt = [BOS_ID] + self.tokenized_raw_prompt
+            self.tokenized_raw_arg_prompt = [BOS_ID] + self.tokenized_raw_arg_prompt
         self.arg_prompt_len = len(self.tokenized_raw_arg_prompt)
         try:
             self.substitute_index = self.tokenized_raw_prompt.index(PAD_ID)
@@ -471,6 +519,44 @@ class Toolformer(nn.Module):
 
 
         print("INITed Toolformer")
+
+    def load_model_and_tokenizer(self, model_name, device=0):
+        
+        if model_name == "MOCK":
+            return MockModel(), MockTokenizer() 
+        
+        cache_option = {} if CACHE_DIR is None else {"cache_dir": CACHE_DIR}
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **cache_option)
+        tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
+        # Store standard config to add this during forward pass
+        self.add_bos_token = tokenizer.add_bos_token
+        # Set to false to make this manual
+        tokenizer.add_bos_token = False
+
+        kwargs = {
+            "torch_dtype": torch.float16,
+            "low_cpu_mem_usage": True,
+        }
+        if "gptj" in model_name.lower():
+            kwargs.update({
+                "revision": "float16",
+                "config": GPTJConfig.from_pretrained(model_name, padding_idx=tokenizer.pad_token_id),
+            })
+        elif "llama" in model_name.lower():
+            kwargs.update({
+                "token": "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",
+                "config": LlamaConfig.from_pretrained(model_name, padding_idx=tokenizer.pad_token_id),
+            })
+        elif "mistral" in model_name.lower():
+            pass
+        else:
+            print(f"Model name {model_name} not recognized")
+        
+        model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs).to(device)
+
+        return model, tokenizer    
+
 
     @torch.no_grad()
     def sample_API_positions(
@@ -536,7 +622,7 @@ class Toolformer(nn.Module):
         attention_mask: torch.Tensor = None,
     ) -> Tuple[Dict, int, Dict]:
         
-        global MASKED_ARG_GENERATION, API_START_ID, ARG_GEN_STOPPERS, PAD_ID, DECODE, ENCODE, LLAMA
+        global MASKED_ARG_GENERATION, API_START_ID, ARG_GEN_STOPPERS, PAD_ID, DECODE, ENCODE
 
         if attention_mask is None:
             attention_mask = prompt_data != PAD_ID
@@ -604,8 +690,9 @@ class Toolformer(nn.Module):
         part_timers["prepare"] += finish_section
         part_timers["forward"] -= finish_section
 
-        for sentence in input_ids:
-            print(DECODE(sentence))
+        if self.debug_level > 1:
+            logging.debug(f"Initial prompt: {DECODE(input_ids[0])}")
+            print(DECODE(input_ids[0]))
 
         # Add 2 to account for extra ) and ] tokens
         for _ in range(self.max_arg_length + 2):
@@ -678,10 +765,9 @@ class Toolformer(nn.Module):
         # MMMM^^^????
         logging.debug(f"{data_indices.shape[0]}/{prompt_data.shape[0]} examples failed to finish sampling")
         logging.debug(f"These were:")
-        for sentence in input_ids:
-            logging.debug(f"{DECODE(sentence)}")
-            arg = sentence[initial_prime_length:]
-            logging.debug(f"{DECODE(arg)}")
+        # Sentences in input_ids with indices still in data_indices
+        for sentence in input_ids[loop_to_batch_idx]:
+            logging.debug(f"{DECODE(sentence[-100:])}")
 
 
         # Return list of tuples (tokenized API call, data index)
@@ -883,18 +969,21 @@ class Toolformer(nn.Module):
     @torch.no_grad()
     def compare_pos_sampling(
         self,
-        data: List[str],
-        model,
-        encode,
+        text: List[str],
+        model: nn.Module = None,
+        tokenizer: PreTrainedTokenizer = None,
     ):
         global FILTER_THRESHOLD_EXPERIMENT, PAD_ID, PAD_TOKEN
         FILTER_THRESHOLD_EXPERIMENT = True
         
+        model = model or self.model
+        encode = (tokenizer or self.tokenizer).encode
+
         PAD_ID = encode(PAD_TOKEN)
         assert len(PAD_ID) == 1
         PAD_ID = PAD_ID[0]
 
-        self.encode = encode
+
         self.tokenized_raw_prompt = encode(self.raw_tool_prompt)
         self.tokenized_raw_arg_prompt = encode(self.raw_arg_prompt)
         try:
@@ -904,11 +993,12 @@ class Toolformer(nn.Module):
 
 
         dataset = PromptDataset(
-            data=data,
+            data=text,
             tokenized_raw_prompt=self.tokenized_raw_prompt,
             tokenized_arg_prompt=self.tokenized_raw_arg_prompt,
             substitute_index=self.substitute_index,
             tokenizer_encode=self.encode,
+            new_to_old_idx=[i for i in range(len(text))],
         )
         dl = PromptDataloader(
             dataset,
@@ -919,17 +1009,17 @@ class Toolformer(nn.Module):
         lengths = []
         
         # TODO: Dl has changed outputs. Should be padded and processed before being passed to sample_API_positions
-        for prompt_tuple, data_pad, data_list, data_length, data_indices in dl:
+        for inserted_prompt_list, data_list, data_length, data_indices in dl:
 
-            prompts, arg_prompts = prompt_tuple
-            prompt_size = prompts.shape[1]
-            prompt_data_pad = torch.cat((prompts, data_pad), dim=1).to(self.device)
+            prompts = left_pad_sequence(inserted_prompt_list, padding_value=PAD_ID).to(self.device)
+            data_pad = pad_sequence(data_list, padding_value=PAD_ID).to(self.device)
+            prompt_data_pad = torch.cat((prompts, data_pad), dim=1)
 
             # SAMPLE API Positions. Each data point can have up to k_positions API calls
             sampled_positions, current_values = self.sample_API_positions(
                 model=model,
                 prompt_data_pad=prompt_data_pad,
-                prompt_size = prompt_size,
+                prompt_size = prompts.shape[1],
                 data_lengths=data_length,
                 sampling_threshold=0,
             )
@@ -1109,7 +1199,7 @@ class Toolformer(nn.Module):
                 idx_pos_sort = torch.argsort(idx_pos[:, 1])
                 arg_gen_prompts = [self.tokenized_raw_arg_prompt]*len(inserted_prompt_list)
             else:
-                idx_pos_sort = torch.argsort(idx_pos[:, 1] +  data_length[idx_pos[:, 0].cpu()],)
+                idx_pos_sort = torch.argsort(idx_pos[:, 1] +  data_length[idx_pos[:, 0].cpu()].to(DEVICE),)
                 arg_gen_prompts = inserted_prompt_list
             idx_pos = idx_pos[idx_pos_sort]
             prompt_data_pad = []
@@ -1123,6 +1213,15 @@ class Toolformer(nn.Module):
             count_idx_pos_processed = 0
             pos_batch_i = 0
             error_count = 0
+
+            print("WE ARE STARTING THE LOOP")
+            # Debugging prints:
+            print(f"n_samples {n_samples}")
+            print(f"arg_gen_batch_size {arg_gen_batch_size}")
+            print(f"count_idx_pos_processed {count_idx_pos_processed}")
+            print(f"n_samples - count_idx_pos_processed {n_samples - count_idx_pos_processed}")
+            print(f"count_idx_pos_processed < n_samples {count_idx_pos_processed < n_samples}")
+
             while count_idx_pos_processed < n_samples:
                 batch1_args_count = 0
                 try:
@@ -1146,6 +1245,7 @@ class Toolformer(nn.Module):
                     logging.info(f"{arg_gen_batch_size} was too large and caused an OOM exception.")
                     logging.info(f"Decreasing batch size by 5 and trying again.")
                     logging.info(f"Number of fails: {error_count}")
+                    print(f"Number of fails: {error_count}")
                     arg_gen_batch_size -= self.BATCH_SIZE_DECREASE_STEP
                     if error_count < self.MAX_CUDA_ERROR_COUNT:
                         continue
@@ -1282,13 +1382,15 @@ class Toolformer(nn.Module):
             try:
                 argv = date[new_to_old_idx[call.data_idx]] if date else None
                 response = self.tool(args, argv)
-                if isinstance(response, float): response = str(response)
-                assert isinstance(response, str), f"API response has type {type(response)} is not a string"
+                if not isinstance(response, list): response = [response]
+                for i, item in enumerate(response):
+                    if isinstance(item, float) or isinstance(item, int): item = str(item)
+                    assert isinstance(item, str), f"API response has type {type(item)} is not a string"
 
-                response = self.encode(response, truncation=True, max_length=TRUNCATE_LENGTH, return_tensors='pt').long().squeeze(0)
-                call_len = len(response) + len(tokenized_args) + len(tokenized_data[call.data_idx])
+                    item = self.encode(item, truncation=True, max_length=TRUNCATE_LENGTH, return_tensors='pt').long().squeeze(0)
+                    call_len = len(item) + len(tokenized_args) + len(tokenized_data[call.data_idx])
                 
-                calls_and_responses.append((tokenized_args, response, call.position, call.data_idx, call.call_idx, call_len))
+                    calls_and_responses.append((tokenized_args, item, call.position, call.data_idx, call.call_idx, call_len))
             except Exception as e:
                 logging.debug(f"args {args} caused tool to fail")
                 logging.debug(f"Caught exception: {e}")
@@ -1338,7 +1440,8 @@ class Toolformer(nn.Module):
         # Filter by perplexity improvement
         num_passed = 0
         num_failed = 0
-        results = []
+        num_had_better_response = 0
+        results = {}
 
         logging.info("FILTERING API CALLS")
 
@@ -1447,7 +1550,7 @@ class Toolformer(nn.Module):
             # Pad data_triplet to same length
             pad = partial(pad_sequence, batch_first=True, padding_value=PAD_ID)
             padded_data_triplet = tuple([pad(x) for x in data_triplet])
-            if LLAMA:
+            if self.add_bos_token:
                 # Add bos token to the data_triplet:
                 data_tokens, data_call_tokens, data_resp_tokens = [torch.cat([BOS_ID*torch.ones((x.shape[0],1)), x.cpu()], dim=1).long() for x in padded_data_triplet]
 
@@ -1507,7 +1610,10 @@ class Toolformer(nn.Module):
             selected_responses = [clean_resps[i] for i in selected_indices]
 
             for index, loss, call, resp, pos, call_idx in zip(output['selected_indices'], output['loss_selected'], selected_calls, selected_responses, position_triplet[0][selected_mask], output['call_indices']):
-                if LLAMA: pos = pos - 1   # Observed in LLama pos is one off, perhaps <bos>?
+                if results.get(call_idx, {"loss_improvement":-1000})["loss_improvement"] > loss:
+                    num_had_better_response += 1
+                    continue
+
                 call_idx = call_idx.item()
                 tokenized_text = tokenized_data[index]
 
@@ -1517,7 +1623,7 @@ class Toolformer(nn.Module):
 
                 # TODO add positions
                 row = {'text': DECODE(tokenized_text), 'API_calls_text': DECODE(text_call), 
-                       'API_call_response_text': DECODE(text_resp), 'positon': pos.item(), 
+                       'API_call_response_text': DECODE(text_resp), 'position': pos.item(), 
                        'loss_improvement': loss.item(), 
                        'index': new_to_old_idx[index]}
                 logging.debug(f"Saving call {call_idx} with loss {loss.item()}")
@@ -1529,7 +1635,8 @@ class Toolformer(nn.Module):
                 if len(additional_output.get(call_idx, {})) > 0:
                     for key, value in additional_output[call_idx].items():
                         row[key] = value
-                results.append(row)
+
+                results[call_idx] = row
 
             pending = new_batch()
             fill_pending() 
@@ -1537,6 +1644,8 @@ class Toolformer(nn.Module):
         # STATS
         generation_stats['Time to filter'] = time.time() - prev_time
         generation_stats['Number of calls passed filtering'] = num_passed
+        generation_stats['Number of calls failed filtering'] = num_failed
+        generation_stats['Number of calls with better response'] = num_had_better_response
         generation_stats['Time (total pipeline)'] = time.time() - start_total_time
         generation_stats['Time key to example length for per example averaging'] = {
             'Time to sample (TOTAL)': generation_stats['Number of input examples'],
@@ -1563,7 +1672,7 @@ class Toolformer(nn.Module):
             print(torch.cuda.memory_summary(device=self.device))
             logging.info(torch.cuda.memory_summary(device=self.device))
 
-        return results, generation_stats
+        return list(results.values()), generation_stats
 
 
 

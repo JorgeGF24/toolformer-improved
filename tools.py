@@ -228,4 +228,4 @@ def WikiSearch(term: str, args=None):
     global searcher
     assert len(term) > 0, "Argument to the WikiSearch API should not be empty."
     hits = searcher.search(term)
-    return hits[0].raw
+    return hits[0].lucene_document.get('raw')
