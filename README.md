@@ -1,5 +1,8 @@
 # Toolformer Enhanced: Master's Project Repository
 
+
+THIS IS A WIP. NOT MEANT FOR PUBLIC USEAGE YET.
+
 ## Introduction
 
 Welcome to the repository of my master's project, an enhanced version of the Toolformer research. This project builds upon the innovative concepts introduced in the original Toolformer paper, aiming to extend its capabilities and applications. Due to the unavailability of the official repository, this project is developed based on the `toolformer-luci` repo by Lucidrain, with significant improvements and custom enhancements.
